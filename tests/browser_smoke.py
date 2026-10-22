@@ -3,6 +3,8 @@ Uses mocked API responses; does not spend real Gemini quota.
 Start `npm run build && npm start` first. Screenshots are written under /tmp.
 """
 import os
+import io
+import wave
 from urllib.parse import urlsplit, parse_qs
 from playwright.sync_api import sync_playwright
 
@@ -35,20 +37,23 @@ with sync_playwright() as p:
             route.fulfill(json=payload)
     page.route('**/api/generate',generate)
     page.route('**/api/artwork?*',lambda r:r.fulfill(json={'artwork':None}))
-    spotify_calls = []
-    def spotify(route):
+    preview_calls = []
+    def preview(route):
         title = parse_qs(urlsplit(route.request.url).query)['title'][0]
-        spotify_calls.append(title)
+        preview_calls.append(title)
         if title.endswith('3'):
-            route.fulfill(json={'track':None})
+            route.fulfill(json={'preview':None})
         elif title.endswith('4'):
-            route.fulfill(status=503,json={'error':{'code':'SPOTIFY_NOT_CONFIGURED','message':'Spotify preview is unavailable right now. You can still open the song on Spotify.'}})
+            route.fulfill(status=503,json={'error':{'code':'PREVIEW_UNAVAILABLE','message':'Audio previews are temporarily unavailable. You can still open this song on Spotify.'}})
         else:
-            track_id = 'ABCDEFGHIJKLMNOPQRSTUV' if title.endswith('2') else '0123456789ABCDEFGHIJKL'
-            route.fulfill(json={'track':{'id':track_id,'title':title,'artists':['Artist']}})
-    page.route('**/api/spotify?*',spotify)
-    page.route('https://open.spotify.com/embed/**',lambda r:r.fulfill(content_type='text/html',body='<html><body style="background:#191b1e;color:#a0a4ab;font:14px sans-serif">Spotify player — controlled browser test</body></html>'))
-
+            clip = '2' if title.endswith('2') else '1'
+            route.fulfill(json={'preview':{'url':f'https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview/test-{clip}.m4a','storeUrl':'https://music.apple.com/us/album/test/123?i=456'}})
+    page.route('**/api/preview?*',preview)
+    wav_data = io.BytesIO()
+    with wave.open(wav_data, 'wb') as wav:
+        wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(8000)
+        wav.writeframes(b'\x00\x00' * 24000)
+    page.route('https://audio-ssl.itunes.apple.com/**',lambda r:r.fulfill(content_type='audio/wav',body=wav_data.getvalue()))
     page.reload()
     page.get_by_role('button',name='Generate playlist').wait_for(state='visible')
     page.wait_for_function("!document.querySelector('button[type=submit]').disabled")
@@ -69,31 +74,41 @@ with sync_playwright() as p:
     assert state['calls']==1
     assert page.locator('textarea').input_value()=='Late-night drive'
     assert 'A%20song' in page.locator('.spotify-link').first.get_attribute('href')
-    assert page.locator('iframe').count() == 0
-    assert not spotify_calls, 'No Spotify lookups before a preview click'
+    assert page.locator('audio').count() == 0
+    assert not preview_calls, 'No preview lookup before a click'
     page.locator('.preview-trigger').nth(0).click()
-    page.locator('iframe').wait_for()
-    assert '0123456789ABCDEFGHIJKL' in page.locator('iframe').get_attribute('src')
-    assert len(spotify_calls) == 1
-    page.get_by_role('button',name='Close Spotify preview').click()
-    assert page.locator('iframe').count() == 0
+    page.locator('audio').wait_for()
+    assert 'test-1.m4a' in page.locator('audio').get_attribute('src')
+    assert page.locator('audio').get_attribute('autoplay') is None
+    assert len(preview_calls) == 1
+    page.locator('audio').evaluate('(a) => a.play()')
+    page.wait_for_function("document.querySelector('audio').currentTime > 0")
+    page.evaluate('window.oldPreview = document.querySelector("audio")')
+    page.get_by_role('button',name='Close audio preview').click()
+    assert page.locator('audio').count() == 0
+    assert page.evaluate('window.oldPreview.paused && !window.oldPreview.getAttribute("src")')
     assert page.evaluate('document.activeElement.id') == 'preview-trigger-0'
     page.locator('.preview-trigger').nth(0).click()
-    page.locator('iframe').wait_for()
-    assert len(spotify_calls) == 1, 'Successful match cached in browser memory'
+    page.locator('audio').wait_for()
+    assert len(preview_calls) == 1, 'Successful match cached in browser memory'
+    page.locator('audio').evaluate('(a) => a.play()')
+    page.evaluate('window.oldPreview = document.querySelector("audio")')
     page.locator('.preview-trigger').nth(1).click()
-    page.wait_for_function("document.querySelector('iframe')?.src.includes('ABCDEFGHIJKLMNOPQRSTUV')")
-    assert page.locator('iframe').count() == 1, 'Only one player can be open'
+    page.wait_for_function("document.querySelector('audio')?.src.includes('test-2.m4a')")
+    assert page.locator('audio').count() == 1, 'Only one audio player can be open'
+    assert page.evaluate('window.oldPreview.paused && !window.oldPreview.getAttribute("src")')
+    page.locator('audio').dispatch_event('error')
+    page.get_by_text('This audio preview could not play.',exact=False).wait_for()
+    assert page.locator('audio').count() == 0
     page.locator('.preview-trigger').nth(2).click()
-    page.get_by_text('No exact Spotify match found.',exact=False).wait_for()
-    assert page.locator('iframe').count() == 0
+    page.get_by_text('No audio preview is available for this song.',exact=False).wait_for()
+    assert page.locator('audio').count() == 0
     page.locator('.preview-trigger').nth(3).click()
-    page.get_by_text('Spotify preview is unavailable right now.',exact=False).wait_for()
-    assert page.locator('iframe').count() == 0
+    page.get_by_text('Audio previews are temporarily unavailable.',exact=False).wait_for()
+    assert page.locator('audio').count() == 0
     assert state['calls'] == 1, 'Preview does not generate a playlist or spend generation quota'
     page.locator('.preview-trigger').nth(0).click()
-    page.locator('iframe').wait_for()
-
+    page.locator('audio').wait_for()
     page.get_by_role('button',name='Copy',exact=True).click()
     assert 'Playlist copied.' in page.get_by_role('status').inner_text()
     assert '1. A song for the evening 1' in page.evaluate('navigator.clipboard.readText()')
@@ -112,7 +127,7 @@ with sync_playwright() as p:
     page.get_by_role('button',name='20 songs',exact=True).click()
     page.get_by_role('button',name='Regenerate',exact=True).click()
     page.wait_for_function("document.querySelectorAll('.song-list li').length===20")
-    assert page.locator('iframe').count() == 0, 'Regeneration closes the old player'
+    assert page.locator('audio').count() == 0, 'Regeneration closes the old player'
     assert state['calls']==2
     for kind in ['json','html']:
         state['block'] = kind
@@ -132,4 +147,4 @@ with sync_playwright() as p:
     page.wait_for_function("document.querySelector('.song-list')!==null")
     assert not errors, errors
     browser.close()
-    print('PASS: missing config, validation, prompts, skeleton, exact counts, Spotify links, copy, TXT/CSV downloads, regeneration, native JSON/HTML rate-limit errors, Spotify previews/matching/cache/fallback/one-player behavior, responsive widths; no browser errors.')
+    print('PASS: missing config, validation, prompts, skeleton, exact counts, Spotify links, copy, TXT/CSV downloads, regeneration, native JSON/HTML rate-limit errors, iTunes previews/playback/cache/errors/pause-on-close/one-player behavior, responsive widths; no browser errors.')

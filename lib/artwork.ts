@@ -5,18 +5,54 @@ export function normalize(s: string) {
     .toLowerCase()
     .replace(/[^\p{L}\p{N}]/gu, "");
 }
-export function matchingArtwork(
+export type AudioPreview = { url: string; storeUrl: string };
+export type ItunesMedia = {
+  artwork: string | null;
+  preview: AudioPreview | null;
+};
+function appleUrl(
+  value: unknown,
+  kind: "artwork" | "audio" | "store",
+): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password) return null;
+    const host = url.hostname;
+    const assets = host.endsWith(".mzstatic.com");
+    const allowed =
+      kind === "artwork"
+        ? assets
+        : kind === "audio"
+          ? assets ||
+            ["audio-ssl.itunes.apple.com", "audio.itunes.apple.com"].includes(
+              host,
+            )
+          : ["music.apple.com", "itunes.apple.com"].includes(host);
+    return allowed ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+export function isAudioPreview(value: unknown): value is AudioPreview {
+  if (!value || typeof value !== "object") return false;
+  const p = value as Record<string, unknown>;
+  return !!appleUrl(p.url, "audio") && !!appleUrl(p.storeUrl, "store");
+}
+export function matchingItunesMedia(
   results: unknown[],
   title: string,
   artist: string,
-): string | null {
+): ItunesMedia {
+  const media: ItunesMedia = { artwork: null, preview: null };
+  if (!normalize(title) || !normalize(artist)) return media;
   for (const item of results) {
     if (!item || typeof item !== "object") continue;
     const r = item as Record<string, unknown>;
     if (
       typeof r.trackName !== "string" ||
       typeof r.artistName !== "string" ||
-      typeof r.artworkUrl100 !== "string"
+      (r.kind !== undefined && r.kind !== "song")
     )
       continue;
     if (
@@ -24,13 +60,18 @@ export function matchingArtwork(
       normalize(r.artistName) !== normalize(artist)
     )
       continue;
-    try {
-      const url = new URL(r.artworkUrl100);
-      if (url.protocol === "https:" && url.hostname.endsWith(".mzstatic.com"))
-        return url.href;
-    } catch {
-      /* use placeholder */
-    }
+    media.artwork ??= appleUrl(r.artworkUrl100, "artwork");
+    const url = appleUrl(r.previewUrl, "audio");
+    const storeUrl = appleUrl(r.trackViewUrl, "store");
+    if (!media.preview && url && storeUrl) media.preview = { url, storeUrl };
+    if (media.artwork && media.preview) break;
   }
-  return null;
+  return media;
+}
+export function matchingArtwork(
+  results: unknown[],
+  title: string,
+  artist: string,
+): string | null {
+  return matchingItunesMedia(results, title, artist).artwork;
 }

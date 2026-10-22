@@ -22,7 +22,7 @@ import {
   playlistText,
   type Playlist,
 } from "@/lib/contracts";
-import { SpotifyPreview } from "@/components/spotify-preview";
+import { AudioPreview } from "@/components/audio-preview";
 const examples = [
   "Late-night drive",
   "Slow Sunday morning",
@@ -498,7 +498,7 @@ export default function Home() {
                     aria-label={`Preview ${song.title} by ${song.artist}`}
                     aria-expanded={previewSong === i}
                     aria-controls={
-                      previewSong === i ? `spotify-preview-${i}` : undefined
+                      previewSong === i ? `audio-preview-${i}` : undefined
                     }
                     onClick={() => setPreviewSong(previewSong === i ? null : i)}
                   >
@@ -517,10 +517,10 @@ export default function Home() {
                   </a>
                 </div>
                 {previewSong === i && (
-                  <SpotifyPreview
+                  <AudioPreview
                     key={JSON.stringify(song)}
                     song={song}
-                    id={`spotify-preview-${i}`}
+                    id={`audio-preview-${i}`}
                     onClose={() => {
                       setPreviewSong(null);
                       document.getElementById(`preview-trigger-${i}`)?.focus();
@@ -531,9 +531,9 @@ export default function Home() {
             ))}
           </ol>
           <p className="result-note">
-            AI recommendations, made to explore. Preview players appear for
-            matched Spotify tracks; playback availability is controlled by
-            Spotify. Artwork via iTunes, when available.
+            AI recommendations, made to explore. Artwork and short audio
+            previews are provided courtesy of iTunes, when available. Spotify
+            links open a song search.
           </p>
         </section>
       ) : (
