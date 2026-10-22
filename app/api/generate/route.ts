@@ -1,9 +1,14 @@
-import { parseInput, type Usage } from "@/lib/contracts";
-import { quota, generate, errorResponse, ServiceError } from "@/lib/server";
+import { parseInput } from "@/lib/contracts";
+import {
+  checkConfig,
+  enforceRateLimit,
+  generate,
+  errorResponse,
+  ServiceError,
+} from "@/lib/server";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 export async function POST(request: Request) {
-  let usage: Usage | undefined;
   let consumed = false;
   try {
     const origin = request.headers.get("origin");
@@ -28,21 +33,14 @@ export async function POST(request: Request) {
         "INVALID_INPUT",
       );
     }
-    const reservation = await quota(request, true);
-    usage = reservation.usage;
-    if (!reservation.accepted)
-      throw new ServiceError(
-        "All five generations have been used. Your next slot opens at the time shown below.",
-        429,
-        "RATE_LIMITED",
-      );
+    checkConfig();
+    await enforceRateLimit(request);
     consumed = true;
     const playlist = await generate(input.mood, input.count);
-    return Response.json(
-      { ...playlist, usage },
-      { headers: { "Cache-Control": "no-store" } },
-    );
+    return Response.json(playlist, {
+      headers: { "Cache-Control": "no-store" },
+    });
   } catch (e) {
-    return errorResponse(e, usage, consumed);
+    return errorResponse(e, consumed);
   }
 }

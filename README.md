@@ -1,79 +1,59 @@
 # MoodMix
 
-Every feeling deserves a soundtrack. A compact, single-page music discovery app built with Next.js App Router, TypeScript, Tailwind CSS, Lucide, Gemini, and Upstash Redis. Fonts are self-hosted Roboto and JetBrains Mono; no Google Fonts request is needed at build or runtime.
+Every feeling deserves a soundtrack. Single-page music discovery with Next.js, TypeScript, Tailwind CSS, Gemini, and native Vercel Firewall request limiting. No database, Redis, Upstash, login, or Spotify credentials. Roboto and JetBrains Mono are self-hosted.
 
 ## Deploy on Vercel
 
-1. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/apikey). Check model availability, quotas, and billing in your Google project; free-tier availability is not guaranteed.
-2. Create an [Upstash Redis](https://console.upstash.com/) database. Copy its **REST URL** and **REST token** (not the Redis connection string).
-3. Import this GitHub repository into Vercel. Use the detected **Next.js** preset, repository root as the root directory, and Node.js **24.x**. The install and build commands are `npm ci` and `npm run build`.
-4. Add these variables in Vercel → Project → Settings → Environment Variables for every deployment environment you intend to test:
+1. Import this repository using the Next.js preset and Node.js 24.x. Use `npm ci` and `npm run build`.
+2. Add `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey) in Project → Settings → Environment Variables. Optionally set `GEMINI_MODEL`; the default is `gemini-2.5-flash`. Use a compatible model available to your Google project. Keep credentials server-side; never use `NEXT_PUBLIC_` names. Remove any old Upstash variables; they are unused.
+3. Configure a native **programmatic rate-limit rule** in your Vercel project's **Firewall**, using the **Rate Limit ID / SDK condition** `moodmix-generation`. Set a per-client limit and a duration supported by your plan. The app calls `checkRateLimit('moodmix-generation', { request, timeout: 5000 })` before calling Gemini. Follow [Vercel's SDK guide](https://vercel.com/docs/vercel-waf/rate-limiting-sdk) for the current dashboard controls and plan availability. Enable/enforce the rule rather than leaving it in log-only mode. A normal path-only rule is not a replacement for the required matching SDK rule.
+4. Deploy/redeploy. Verify a real request succeeds, then lower the rule's threshold temporarily and confirm further requests are rejected. Restore your intended threshold afterward. Vercel Firewall configuration is a project setting; pushing code does not create or activate it.
 
-   | Variable                   | Value                                                                                          |
-   | -------------------------- | ---------------------------------------------------------------------------------------------- |
-   | `GEMINI_API_KEY`           | Your Gemini API key                                                                            |
-   | `GEMINI_MODEL`             | Optional; defaults to `gemini-2.5-flash`. Set to a compatible model available to your project. |
-   | `UPSTASH_REDIS_REST_URL`   | HTTPS REST URL from Upstash                                                                    |
-   | `UPSTASH_REDIS_REST_TOKEN` | REST token from Upstash                                                                        |
+The original five-per-rolling-24-hours quota has been replaced by your Vercel rule's semantics. Choose five per day only if your Vercel plan and rule editor support that window; this code does not claim a rolling daily quota. Native rule availability, supported durations, and pricing depend on Vercel's current offering. There is no remaining-count/reset-time API in this SDK, so the UI does not show an exact counter or fabricate a reset time.
 
-5. Deploy, or **redeploy after adding/changing variables**. Never put these values in client code, chat, GitHub, or `NEXT_PUBLIC_*` variables. There is no API-key input in the public UI.
-6. Generate a 10-song playlist and check the count drops to 4. Test copy, TXT/CSV export, Spotify search, and regenerate. Five accepted requests in a rolling 24-hour window should disable generation and return HTTP 429. Artwork is best effort and may remain a placeholder.
-
-No Spotify API key, OAuth, login, application database, or additional configuration service is needed. Upstash is required for quota enforcement, including on Vercel previews. Separate Upstash databases can isolate production and preview quotas.
+On Vercel, missing rules, protection failures, and check timeouts block generation before Gemini is called. If you see “Request protection is not configured yet”, check the rule ID, active domain, deployment, and rule configuration. Rules and deployment protection must allow the SDK's internal request; verify preview deployments separately. The SDK uses Vercel's client identity by default; no application database or IP store is involved.
 
 ## Local development
-
-Use Node.js 24 and npm. From the existing checkout:
 
 ```sh
 npm ci --cache /workspace/.npm-cache
 cp .env.example .env.local
-# Fill .env.local securely with your own values.
+# Fill in GEMINI_API_KEY securely; don't overwrite existing local configuration.
 npm run dev
 ```
 
-The explicit workspace cache is useful in this cloud environment. On your own machine, ordinary `npm ci` works. Do not overwrite an existing `.env.local`. Without credentials, the UI runs and explains that generation is unconfigured; generation fails closed before calling Gemini. Local development uses a single shared `local-development` quota identity because client IP headers outside Vercel are untrusted.
+On your own machine, ordinary `npm ci` is sufficient. Node.js 24 is required. Missing Gemini configuration disables generation with a useful message. Platform rate limiting is skipped outside Vercel, including a local production build; the UI labels local development accordingly. Never treat this local behavior as deployed protection. No in-memory counter or localStorage quota is used.
 
 ## Validation
 
 ```sh
-npm test                 # Input/output validation and API tests with controlled upstream responses
+npm test
 npm run typecheck
 npm run build
-npm start                # Run the production build
+npm start
 ```
 
-The automated suite covers exact track counts, duplicate detection, export escaping, safe artwork matching, malformed-output retry limits, provider failures, missing configuration, quota rejection, and charged failures. It does not use real credentials or spend Gemini quota.
+Tests use controlled Gemini and native Firewall responses, without credentials or paid requests. Coverage includes input validation, exact unique song counts, artwork matching, exports, retry limits, native rate rejection, missing rules, timeouts, and ensuring rejected requests never call Gemini.
 
-Optional real Redis integration test (requires installed `redis-server` and `redis-cli`; starts its own temporary Unix-socket instance):
-
-```sh
-npm run test:quota
-```
-
-`REDIS_SERVER` and `REDIS_CLI` may override the binary paths. This test submits 30 concurrent reservations, asserts exactly 5 succeed, and verifies rolling expiry and read-only usage checks.
-
-Optional browser smoke test with the production server running and Python Playwright installed:
+Optional browser checks with the production server running without Gemini credentials, Python Playwright, and Chromium:
 
 ```sh
 CHROMIUM_PATH=/usr/bin/chromium python tests/browser_smoke.py
 ```
 
-The browser test uses mocked generation/usage/artwork responses and checks form interaction, skeletons, 10/20-song results, clipboard, downloads, regeneration, exhausted limits, and 320px/390px layouts. It expects the server to have no real API credentials for its initial fail-closed check. Screenshots go under `/tmp`.
+Browser tests use controlled status/generation/artwork responses, exercise desktop and mobile layouts, copy, TXT/CSV, regeneration, and HTML/JSON rate-limit errors, and preserve the existing playlist after a blocked request. They do not verify a real Vercel rule.
 
-## API and quota behavior
+## Behavior
 
-- `POST /api/generate`: JSON `{ "mood": "A nostalgic rainy afternoon", "count": 15 }`. Mood must be nonblank and at most 500 characters; count must be 10, 15, or 20. Returns validated title, description, exact unique track count, and usage.
-- `GET /api/usage`: Reads the authoritative quota without reserving a slot.
-- `GET /api/artwork?title=...&artist=...`: Best-effort iTunes lookup. Only exact normalized title **and** artist matches can supply artwork, restricted to HTTPS Apple artwork hosts. Missing matches use a placeholder. The browser runs up to three concurrent lookups and caches results in memory for the session.
-- Errors use `{ "error": { "code": "...", "message": "...", "consumed": false }, "usage": { ... } }`. Usage is included when known. HTTP 429 includes `Retry-After` and the earliest next slot time.
+- `POST /api/generate`: JSON `{ "mood": "A nostalgic rainy afternoon", "count": 15 }`. Mood must be nonblank and at most 500 characters. Count must be 10, 15, or 20. Returns validated title, description, and exactly that many unique title/artist pairs.
+- `GET /api/status`: Checks Gemini configuration without calling Gemini or consuming a rate-limit check. Returns only `rateLimitMode: "vercel" | "local"`. This is a configuration check, not proof the Firewall rule is active; enforcement happens on POST.
+- `GET /api/artwork?title=...&artist=...`: Best-effort iTunes lookup; exact normalized artist/title matches only. Artwork failures never block a playlist. The browser limits concurrency to three and caches lookups in memory for the session.
+- Application errors: `{ "error": { "code": "...", "message": "...", "consumed": false } }`. `consumed` indicates the request reached generation, not a precise quota balance. Native rate rejection returns 429. An edge Firewall rule can respond with non-JSON content, which the UI also handles.
 
-Quota is five accepted generation requests per rolling 24 hours, implemented as an atomic Redis Lua sorted-set reservation. It is shared across server instances and survives cold starts. Each accepted attempt is counted even if Gemini fails. There are no refunds or client-side automatic generation retries. Only malformed/incomplete model output receives at most one internal retry, within the same reserved slot. Authentication failures, provider quota errors, timeouts, and quota-store failures are never automatically retried.
+Accepted requests may count toward the configured limit even if Gemini fails. No client generation retries occur automatically. Only malformed/incomplete model output gets one internal retry, without a second Firewall check. Authentication failures, provider quota errors, protection failures, and timeouts are not retried automatically.
 
-On Vercel, the platform-provided `x-forwarded-for` client IP is HMAC-hashed using the server-only Redis token; raw IPs are never stored in quota keys or sent to the browser. This assumes direct Vercel ingress; reassess trusted headers before putting another proxy in front of the app or porting to another host. Rotating the Redis token changes quota keys. People sharing a network may share quota; changing networks may yield a new quota. This is approximate abuse control, not per-person identification. Storage failure blocks generation. Add provider spending caps/alerts for a public launch; IP quotas do not impose a global cost ceiling.
+Copy/export and artwork do not call the programmatic generation limiter. Spotify buttons open searches; AI suggestions are not independently verified on Spotify. Conservative artwork matching prefers a placeholder over unrelated images. Playlists live only in the current page session. Anonymous request limits may be shared by people on the same network.
 
-AI recommendations are not independently verified against Spotify; Spotify buttons open searches. Conservative artwork matching may miss valid versions or collaborations rather than display unrelated art. Nothing is persisted as application data; playlists live in the current page session. Copy and export work without additional generation requests.
+## Verification limits
 
-## Verified here / still requires your deployment
-
-The production build, TypeScript checks, controlled-response API tests, real-Redis atomic quota integration, and Chromium UI smoke checks are validated locally. Live Gemini output, your Upstash credentials, and a Vercel deployment require your account configuration and are not claimed as verified. No real credentials are bundled.
+Build, type checking, native-SDK API tests with controlled responses, and browser checks run locally. Real Gemini output and an active native Firewall rule require your Vercel account/configuration and are not claimed as verified. Live artwork requests may be blocked by this cloud workspace's network policy. No secrets are bundled.

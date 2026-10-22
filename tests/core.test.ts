@@ -7,7 +7,7 @@ import {
   playlistText,
 } from "../lib/contracts";
 import { matchingArtwork } from "../lib/artwork";
-import { generate, quota, ServiceError } from "../lib/server";
+import { generate, enforceRateLimit, ServiceError } from "../lib/server";
 import { POST } from "../app/api/generate/route";
 const songs = Array.from({ length: 10 }, (_, i) => ({
   title: `Song ${i}`,
@@ -30,8 +30,6 @@ function gemini(p: unknown = playlist) {
 }
 function configure() {
   process.env.GEMINI_API_KEY = "test-key";
-  process.env.UPSTASH_REDIS_REST_URL = "https://test.upstash.io";
-  process.env.UPSTASH_REDIS_REST_TOKEN = "test-token";
   delete process.env.VERCEL;
 }
 const originalFetch = global.fetch;
@@ -99,26 +97,62 @@ test("artwork rejects unrelated title, artist and untrusted URLs", () => {
     null,
   );
 });
-test("backend integration and retry policy", async (t) => {
+test("backend integration and native Vercel rate limiting", async (t) => {
+  const originalEnv = {
+    GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+    VERCEL: process.env.VERCEL,
+    NODE_ENV: process.env.NODE_ENV,
+  };
   configure();
+  const req = (body: unknown = { mood: "quiet", count: 10 }) =>
+    new Request("http://moodmix.test/api/generate", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        host: "moodmix.test",
+        "x-real-ip": "203.0.113.1",
+      },
+      body: JSON.stringify(body),
+    });
+  const deployed = () =>
+    Object.assign(process.env, { VERCEL: "1", NODE_ENV: "production" });
   t.after(() => {
     global.fetch = originalFetch;
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   });
   await t.test(
-    "missing config fails closed without calling external APIs",
+    "missing Gemini fails before rate check or model call",
     async () => {
+      deployed();
       delete process.env.GEMINI_API_KEY;
       let calls = 0;
       global.fetch = async () => {
         calls++;
         return gemini();
       };
-      await assert.rejects(
-        () => quota(new Request("http://localhost"), true),
-        ServiceError,
-      );
+      const r = await POST(req());
+      assert.equal(r.status, 503);
       assert.equal(calls, 0);
       configure();
+    },
+  );
+  await t.test(
+    "local development needs Gemini only and no platform rate check",
+    async () => {
+      configure();
+      let calls = 0;
+      global.fetch = async (url) => {
+        calls++;
+        assert.match(String(url), /generativelanguage/);
+        return gemini();
+      };
+      const r = await POST(req());
+      assert.equal(r.status, 200);
+      assert.equal((await r.json()).songs.length, 10);
+      assert.equal(calls, 1);
     },
   );
   await t.test("valid model response makes one call", async () => {
@@ -130,138 +164,168 @@ test("backend integration and retry policy", async (t) => {
     assert.deepEqual(await generate("quiet", 10), playlist);
     assert.equal(calls, 1);
   });
-  await t.test("malformed output gets only one internal retry", async () => {
+  await t.test("malformed output gets at most one retry", async () => {
     let calls = 0;
     global.fetch = async () => {
       calls++;
-      return gemini({ ...playlist, songs: [] });
+      return gemini({});
     };
     await assert.rejects(() => generate("quiet", 10));
     assert.equal(calls, 2);
   });
-  await t.test("malformed then valid recovers", async () => {
+  await t.test("malformed then valid output recovers", async () => {
     let calls = 0;
     global.fetch = async () => (++calls === 1 ? gemini({}) : gemini());
     assert.deepEqual(await generate("quiet", 10), playlist);
     assert.equal(calls, 2);
   });
   for (const status of [401, 403, 429, 500])
-    await t.test(`upstream ${status} never retries`, async () => {
+    await t.test(`Gemini ${status} never retries`, async () => {
       let calls = 0;
       global.fetch = async () => {
         calls++;
-        return new Response("", { status });
+        return new Response(null, { status });
       };
       await assert.rejects(() => generate("quiet", 10));
       assert.equal(calls, 1);
     });
-  await t.test("network timeout never retries", async () => {
+  await t.test("model timeout never retries", async () => {
     let calls = 0;
     global.fetch = async () => {
       calls++;
-      throw new DOMException("Timed out", "TimeoutError");
+      throw new DOMException("Timeout", "TimeoutError");
     };
     await assert.rejects(() => generate("quiet", 10));
     assert.equal(calls, 1);
   });
-  const req = (body: unknown) =>
-    new Request("http://localhost/api/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  await t.test("invalid input never reserves quota", async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls++;
-      return gemini();
-    };
-    assert.equal((await POST(req({ mood: " ", count: 10 }))).status, 400);
-    assert.equal(calls, 0);
-  });
-  await t.test("cross-site generation rejected", async () => {
-    const r = new Request("http://localhost/api/generate", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        origin: "https://evil.test",
-      },
-      body: "{}",
-    });
-    assert.equal((await POST(r)).status, 403);
-  });
   await t.test(
-    "limit rejection prevents model call and returns retry-after",
+    "invalid input does not check rate limit or call Gemini",
     async () => {
+      deployed();
       let calls = 0;
       global.fetch = async () => {
         calls++;
-        return Response.json({ result: [0, 0, Date.now() + 60000] });
+        return gemini();
       };
-      const r = await POST(req({ mood: "quiet", count: 10 }));
+      assert.equal((await POST(req({ mood: " ", count: 10 }))).status, 400);
+      assert.equal(calls, 0);
+    },
+  );
+  await t.test(
+    "cross-site requests rejected before external calls",
+    async () => {
+      const r = new Request("http://moodmix.test/api/generate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          origin: "https://evil.test",
+        },
+        body: "{}",
+      });
+      assert.equal((await POST(r)).status, 403);
+    },
+  );
+  await t.test(
+    "native limit rejection stops Gemini and invents no counters",
+    async () => {
+      let calls = 0;
+      global.fetch = async (url) => {
+        calls++;
+        assert.match(
+          String(url),
+          /\.well-known\/vercel\/rate-limit-api\/moodmix-generation$/,
+        );
+        return new Response(null, { status: 429 });
+      };
+      const r = await POST(req());
       assert.equal(r.status, 429);
-      assert.ok(r.headers.get("Retry-After"));
-      assert.equal((await r.json()).usage.remaining, 0);
+      const b = await r.json();
+      assert.equal(b.error.code, "RATE_LIMITED");
+      assert.equal(b.error.consumed, false);
+      assert.equal(b.usage, undefined);
+      assert.equal(r.headers.get("Retry-After"), null);
       assert.equal(calls, 1);
     },
   );
-  await t.test("store failure never calls model", async () => {
+  for (const status of [404, 500])
+    await t.test(`native rule status ${status} fails closed`, async () => {
+      let calls = 0;
+      global.fetch = async () => {
+        calls++;
+        return new Response(null, { status });
+      };
+      const r = await POST(req());
+      assert.equal(r.status, 503);
+      assert.equal((await r.json()).error.consumed, false);
+      assert.equal(calls, 1);
+    });
+  await t.test("firewall blocked returns 403 without generation", async () => {
     let calls = 0;
     global.fetch = async () => {
       calls++;
-      return new Response("", { status: 503 });
+      return new Response(null, { status: 403 });
     };
-    const r = await POST(req({ mood: "quiet", count: 10 }));
-    assert.equal(r.status, 503);
+    const r = await POST(req());
+    assert.equal(r.status, 403);
+    assert.equal((await r.json()).error.code, "FIREWALL_BLOCKED");
     assert.equal(calls, 1);
   });
-  await t.test("accepted failure keeps consumed quota", async () => {
+  await t.test("native rate check timeout fails closed", async () => {
     let calls = 0;
-    global.fetch = async () =>
-      ++calls === 1
-        ? Response.json({ result: [1, 4, Date.now() + 86400000] })
-        : new Response("", { status: 429 });
-    const r = await POST(req({ mood: "quiet", count: 10 }));
-    assert.equal(r.status, 502);
-    const b = await r.json();
-    assert.equal(b.error.consumed, true);
-    assert.equal(b.usage.remaining, 4);
-    assert.equal(calls, 2);
+    global.fetch = async (_url, options) => {
+      calls++;
+      assert.ok(options?.signal);
+      throw new DOMException("Timeout", "TimeoutError");
+    };
+    assert.equal((await POST(req())).status, 503);
+    assert.equal(calls, 1);
   });
   await t.test(
-    "successful API returns validated songs and reserved usage",
+    "allowed request invokes Gemini after native check",
     async () => {
       let calls = 0;
-      global.fetch = async () =>
-        ++calls === 1
-          ? Response.json({ result: [1, 4, Date.now() + 86400000] })
-          : gemini();
-      const r = await POST(req({ mood: "quiet", count: 10 }));
+      global.fetch = async (url) => {
+        calls++;
+        if (calls === 1) {
+          assert.match(String(url), /rate-limit-api/);
+          return new Response(null, { status: 204 });
+        }
+        assert.match(String(url), /generativelanguage/);
+        return gemini();
+      };
+      const r = await POST(req());
       assert.equal(r.status, 200);
       const b = await r.json();
       assert.equal(b.songs.length, 10);
-      assert.equal(b.usage.remaining, 4);
+      assert.equal(b.usage, undefined);
       assert.equal(calls, 2);
     },
   );
   await t.test(
-    "quota command uses a hashed identity and atomic EVAL",
+    "accepted Gemini failure does not repeat native rate check",
     async () => {
-      let command: unknown[] = [];
-      global.fetch = async (_url, options) => {
-        command = JSON.parse(String(options?.body));
-        return Response.json({ result: [1, 4, Date.now() + 86400000] });
+      let calls = 0;
+      global.fetch = async () =>
+        ++calls === 1
+          ? new Response(null, { status: 204 })
+          : new Response(null, { status: 429 });
+      const r = await POST(req());
+      assert.equal(r.status, 502);
+      assert.equal((await r.json()).error.consumed, true);
+      assert.equal(calls, 2);
+    },
+  );
+  await t.test(
+    "deployed development build cannot bypass the SDK check",
+    async () => {
+      Object.assign(process.env, { NODE_ENV: "development" });
+      let calls = 0;
+      global.fetch = async () => {
+        calls++;
+        return gemini();
       };
-      await quota(
-        new Request("http://localhost", {
-          headers: { "x-forwarded-for": "1.2.3.4" },
-        }),
-        true,
-      );
-      assert.equal(command[0], "EVAL");
-      assert.match(String(command[3]), /^moodmix:v1:[a-f0-9]{64}$/);
-      assert.equal(command[5], "1");
-      assert.ok(!JSON.stringify(command).includes("1.2.3.4"));
+      await assert.rejects(() => enforceRateLimit(req()), ServiceError);
+      assert.equal(calls, 0);
     },
   );
 });

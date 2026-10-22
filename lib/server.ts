@@ -1,5 +1,6 @@
-import { createHmac, randomUUID } from "node:crypto";
-import { parsePlaylist, type Usage } from "./contracts";
+import { randomUUID } from "node:crypto";
+import { checkRateLimit } from "@vercel/firewall";
+import { parsePlaylist } from "./contracts";
 export class ServiceError extends Error {
   constructor(
     message: string,
@@ -9,97 +10,43 @@ export class ServiceError extends Error {
     super(message);
   }
 }
+export const RATE_LIMIT_ID = "moodmix-generation";
 export function checkConfig() {
-  if (
-    !process.env.GEMINI_API_KEY ||
-    !process.env.UPSTASH_REDIS_REST_URL ||
-    !process.env.UPSTASH_REDIS_REST_TOKEN
-  )
+  if (!process.env.GEMINI_API_KEY)
     throw new ServiceError(
-      "Generation is not configured yet. The site owner needs to connect Gemini and Upstash.",
+      "Generation is not configured yet. The site owner needs to connect Gemini.",
     );
 }
-// One atomic operation prunes, inspects and (optionally) reserves a rolling-window slot.
-export const quotaScript = `
-local key = KEYS[1]
-local now = tonumber(ARGV[1])
-local window = 86400000
-redis.call('ZREMRANGEBYSCORE', key, '-inf', now-window)
-local count = redis.call('ZCARD', key)
-local accepted = 0
-if ARGV[2] == '1' and count < 5 then
- redis.call('ZADD', key, now, ARGV[3])
- redis.call('PEXPIRE', key, window)
- count = count + 1
- accepted = 1
-end
-local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-local reset = 0
-if #oldest > 0 then reset = tonumber(oldest[2]) + window end
-return {accepted, 5-count, reset}
-`;
-export async function quota(
-  request: Request,
-  reserve: boolean,
-): Promise<{ accepted: boolean; usage: Usage }> {
-  checkConfig();
-  // Vercel overwrites x-forwarded-for. Outside Vercel use one shared local quota.
-  const ip =
-    process.env.VERCEL === "1"
-      ? request.headers.get("x-forwarded-for")?.split(",")[0].trim()
-      : "local-development";
-  if (!ip) throw new ServiceError("Could not establish a safe quota identity.");
-  const digest = createHmac("sha256", process.env.UPSTASH_REDIS_REST_TOKEN!)
-    .update(ip)
-    .digest("hex");
-  let result: unknown;
+export async function enforceRateLimit(request: Request) {
+  // Local development makes no claim of persistent rate limiting.
+  if (process.env.VERCEL !== "1") return;
+  // The SDK skips enforcement in development; never silently do that on Vercel.
+  if (process.env.NODE_ENV !== "production")
+    throw new ServiceError("Rate limiting requires a production Vercel build.");
+  let result;
   try {
-    const url = new URL(process.env.UPSTASH_REDIS_REST_URL!);
-    if (url.protocol !== "https:") throw new Error("HTTPS required");
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify([
-        "EVAL",
-        quotaScript,
-        "1",
-        `moodmix:v1:${digest}`,
-        String(Date.now()),
-        reserve ? "1" : "0",
-        randomUUID(),
-      ]),
-      signal: AbortSignal.timeout(5000),
-      cache: "no-store",
-    });
-    if (!response.ok) throw new Error("Store unavailable");
-    const body = await response.json();
-    if (body.error) throw new Error("Store error");
-    result = body.result;
+    result = await checkRateLimit(RATE_LIMIT_ID, { request, timeout: 5000 });
   } catch {
     throw new ServiceError(
-      "Usage tracking is temporarily unavailable. No generation was started.",
+      "Request protection is temporarily unavailable. No generation was started.",
     );
   }
-  if (
-    !Array.isArray(result) ||
-    result.length !== 3 ||
-    !result.every(Number.isFinite) ||
-    result[1] < 0 ||
-    result[1] > 5 ||
-    result[2] < 0
-  )
-    throw new ServiceError("Usage tracking returned an invalid response.");
-  return {
-    accepted: result[0] === 1,
-    usage: {
-      remaining: result[1],
-      limit: 5,
-      resetAt: result[2] ? new Date(result[2]).toISOString() : null,
-    },
-  };
+  if (result.error === "not-found")
+    throw new ServiceError(
+      "Request protection is not configured yet. The site owner needs to enable the MoodMix rule in Vercel Firewall.",
+    );
+  if (result.error === "blocked")
+    throw new ServiceError(
+      "Vercel Firewall blocked this request.",
+      403,
+      "FIREWALL_BLOCKED",
+    );
+  if (result.rateLimited)
+    throw new ServiceError(
+      "You’ve reached the request limit. Please try again later. Your playlist is still available to copy and export.",
+      429,
+      "RATE_LIMITED",
+    );
 }
 export async function generate(mood: string, count: number) {
   const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
@@ -166,7 +113,7 @@ export async function generate(mood: string, count: number) {
       );
     } catch {
       throw new ServiceError(
-        "The music service timed out or could not be reached. This attempt used one generation.",
+        "The music service timed out or could not be reached. This attempt was sent to the music service.",
         504,
         "UPSTREAM_TIMEOUT",
       );
@@ -174,8 +121,8 @@ export async function generate(mood: string, count: number) {
     if (!response.ok)
       throw new ServiceError(
         response.status === 429
-          ? "The music service has reached its quota. Try later; this attempt used one generation."
-          : "The music service could not complete this request. This attempt used one generation.",
+          ? "The music service has reached its quota. Try later; this attempt was sent to the music service."
+          : "The music service could not complete this request. This attempt was sent to the music service.",
         502,
         "UPSTREAM_ERROR",
       );
@@ -193,7 +140,7 @@ export async function generate(mood: string, count: number) {
     } catch {
       if (attempt === 1)
         throw new ServiceError(
-          "The music service returned an incomplete playlist. This attempt used one generation.",
+          "The music service returned an incomplete playlist. This attempt was sent to the music service.",
           502,
           "INVALID_PLAYLIST",
         );
@@ -201,31 +148,13 @@ export async function generate(mood: string, count: number) {
   }
   throw new ServiceError("Generation failed.");
 }
-export function errorResponse(error: unknown, usage?: Usage, consumed = false) {
+export function errorResponse(error: unknown, consumed = false) {
   const e =
     error instanceof ServiceError
       ? error
       : new ServiceError("Something went wrong. Please try later.");
   return Response.json(
-    {
-      error: { code: e.code, message: e.message, consumed },
-      ...(usage ? { usage } : {}),
-    },
-    {
-      status: e.status,
-      headers: {
-        "Cache-Control": "no-store",
-        ...(e.status === 429 && usage?.resetAt
-          ? {
-              "Retry-After": String(
-                Math.max(
-                  1,
-                  Math.ceil((Date.parse(usage.resetAt) - Date.now()) / 1000),
-                ),
-              ),
-            }
-          : {}),
-      },
-    },
+    { error: { code: e.code, message: e.message, consumed } },
+    { status: e.status, headers: { "Cache-Control": "no-store" } },
   );
 }

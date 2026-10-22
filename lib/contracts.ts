@@ -1,9 +1,4 @@
 export type Song = { title: string; artist: string };
-export type Usage = {
-  remaining: number;
-  limit: number;
-  resetAt: string | null;
-};
 export type Playlist = { title: string; description: string; songs: Song[] };
 export function parseInput(value: unknown): { mood: string; count: number } {
   if (!value || typeof value !== "object")

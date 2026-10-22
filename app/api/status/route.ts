@@ -1,9 +1,10 @@
-import { quota, errorResponse } from "@/lib/server";
+import { checkConfig, errorResponse } from "@/lib/server";
 export const dynamic = "force-dynamic";
-export async function GET(request: Request) {
+export async function GET() {
   try {
+    checkConfig();
     return Response.json(
-      { usage: (await quota(request, false)).usage },
+      { rateLimitMode: process.env.VERCEL === "1" ? "vercel" : "local" },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (e) {

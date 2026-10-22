@@ -2,7 +2,7 @@
 Uses mocked API responses; does not spend real Gemini quota.
 Start `npm run build && npm start` first. Screenshots are written under /tmp.
 """
-import os, json, time
+import os
 from playwright.sync_api import sync_playwright
 
 with sync_playwright() as p:
@@ -16,14 +16,18 @@ with sync_playwright() as p:
     assert page.get_by_role('button',name='Generate playlist').is_disabled()
     assert 'not configured' in page.locator('.message[role=alert]').inner_text()
     assert page.request.post('http://localhost:3000/api/generate',data={'mood':'quiet','count':10}).status == 503
-    state = {'used': 0, 'calls': 0, 'pending': None}
-    def usage(): return {'remaining': 5-state['used'], 'limit':5, 'resetAt':'2099-01-01T00:00:00.000Z' if state['used'] else None}
-    page.route('**/api/usage',lambda r:r.fulfill(json={'usage':usage()}))
+    state = {'calls': 0, 'pending': None, 'block': None}
+    page.route('**/api/status',lambda r:r.fulfill(json={'rateLimitMode':'vercel'}))
     def generate(route):
         state['calls'] += 1
-        state['used'] += 1
+        if state['block']:
+            if state['block'] == 'html':
+                route.fulfill(status=429,content_type='text/html',body='<h1>Too many requests</h1>')
+            else:
+                route.fulfill(status=429,json={'error':{'code':'RATE_LIMITED','message':'Try again later.','consumed':False}})
+            return
         data = route.request.post_data_json
-        payload = {'title':'Somewhere between rain and remembering','description':'Soft edges and familiar voices for the long way home.','songs':[{'title':f'A song for the evening {i+1}','artist':f'Artist {i+1}'} for i in range(data['count'])], 'usage':usage()}
+        payload = {'title':'Somewhere between rain and remembering','description':'Soft edges and familiar voices for the long way home.','songs':[{'title':f'A song for the evening {i+1}','artist':f'Artist {i+1}'} for i in range(data['count'])]}
         if state['calls'] == 1:
             state['pending'] = (route, payload)
         else:
@@ -69,16 +73,22 @@ with sync_playwright() as p:
     page.get_by_role('button',name='Regenerate',exact=True).click()
     page.wait_for_function("document.querySelectorAll('.song-list li').length===20")
     assert state['calls']==2
-    for _ in range(3):
+    for kind in ['json','html']:
+        state['block'] = kind
+        before = state['calls']
         with page.expect_response('**/api/generate'):
             page.get_by_role('button',name='Regenerate',exact=True).click()
-        page.wait_for_function("document.querySelector('.song-list')!==null")
-        page.wait_for_timeout(100)
-    assert state['calls']==5
-    assert page.get_by_role('button',name='Generate playlist').is_disabled()
-    assert page.get_by_role('button',name='Regenerate').is_disabled()
-    assert page.get_by_role('button',name='Copy',exact=True).is_enabled()
-    assert '0 of 5' in page.locator('.usage').inner_text()
+        page.locator('.message[role=alert]').wait_for()
+        assert 'request limit' in page.locator('.message[role=alert]').inner_text()
+        assert page.locator('.song-list li').count() == 20
+        assert page.get_by_role('button',name='Copy',exact=True).is_enabled()
+        page.wait_for_timeout(150)
+        assert state['calls'] == before + 1, 'No automatic retry after rate limit'
+    assert 'remaining' not in page.locator('.usage').inner_text()
+    state['block'] = None
+    with page.expect_response('**/api/generate'):
+        page.get_by_role('button',name='Regenerate',exact=True).click()
+    page.wait_for_function("document.querySelector('.song-list')!==null")
     assert not errors, errors
     browser.close()
-    print('PASS: missing config, validation, prompts, skeleton, exact counts, Spotify links, copy, TXT/CSV downloads, regeneration, limit state, responsive widths; no browser errors.')
+    print('PASS: missing config, validation, prompts, skeleton, exact counts, Spotify links, copy, TXT/CSV downloads, regeneration, native JSON/HTML rate-limit errors, responsive widths; no browser errors.')

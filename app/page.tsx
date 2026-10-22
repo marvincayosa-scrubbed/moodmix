@@ -20,7 +20,6 @@ import {
   playlistCsv,
   playlistText,
   type Playlist,
-  type Usage,
 } from "@/lib/contracts";
 const examples = [
   "Late-night drive",
@@ -79,57 +78,54 @@ export default function Home() {
   const [mood, setMood] = useState("");
   const [count, setCount] = useState(15);
   const [playlist, setPlaylist] = useState<Playlist | null>(null);
-  const [usage, setUsage] = useState<Usage | null>(null);
-  const [usageReady, setUsageReady] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [rateLimitMode, setRateLimitMode] = useState<"vercel" | "local">(
+    "vercel",
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [artwork, setArtwork] = useState<Record<string, string | null>>({});
   const [exportsOpen, setExportsOpen] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [clock, setClock] = useState(Date.now());
   const active = useRef(false);
   const results = useRef<HTMLElement>(null);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const menu = useRef<HTMLDivElement>(null);
-  const usageVersion = useRef(0);
-  const refreshUsage = async () => {
-    const version = ++usageVersion.current;
+  const statusVersion = useRef(0);
+  const refreshStatus = async () => {
+    const version = ++statusVersion.current;
     try {
-      const response = await fetch("/api/usage", {
+      const response = await fetch("/api/status", {
         cache: "no-store",
         signal: AbortSignal.timeout(10000),
       });
       const body = await response.json();
-      if (version !== usageVersion.current) return;
+      if (version !== statusVersion.current) return;
       if (!response.ok)
         throw new Error(
-          body.error?.message || "Usage tracking is unavailable.",
+          body.error?.message || "Could not connect to the music service.",
         );
-      setUsage(body.usage);
-      setUsageReady(true);
+      setRateLimitMode(body.rateLimitMode === "local" ? "local" : "vercel");
+      setReady(true);
       setError("");
     } catch (e) {
-      if (version === usageVersion.current) {
-        setUsageReady(false);
+      if (version === statusVersion.current) {
+        setReady(false);
         setError(
-          e instanceof Error ? e.message : "Usage tracking is unavailable.",
+          e instanceof Error
+            ? e.message
+            : "Could not connect to the music service.",
         );
       }
     }
   };
   useEffect(() => {
-    void refreshUsage();
-    const timer = setInterval(() => setClock(Date.now()), 30000);
+    void refreshStatus();
     return () => {
-      clearInterval(timer);
-      usageVersion.current++;
+      statusVersion.current++;
     };
   }, []);
-  useEffect(() => {
-    if (usage?.resetAt && Date.parse(usage.resetAt) <= clock && !active.current)
-      void refreshUsage();
-  }, [clock, usage?.resetAt]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 4000);
@@ -183,24 +179,15 @@ export default function Home() {
     void Promise.all([worker(), worker(), worker()]);
     return () => controller.abort();
   }, [playlist]);
-  const limitReached = usage?.remaining === 0;
-  const resetLabel = usage?.resetAt
-    ? new Date(usage.resetAt).toLocaleString([], {
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-      })
-    : "";
   async function submit() {
-    if (active.current || limitReached || !usageReady) return;
+    if (active.current || !ready) return;
     if (!mood.trim()) {
       setError("Tell us a little about your mood first.");
       textarea.current?.focus();
       return;
     }
     active.current = true;
-    usageVersion.current++;
+    statusVersion.current++;
     setBusy(true);
     setError("");
     setNotice("");
@@ -212,11 +199,14 @@ export default function Home() {
         body: JSON.stringify({ mood, count }),
         signal: AbortSignal.timeout(58000),
       });
-      const body = await response.json();
-      if (body.usage) setUsage(body.usage);
+      // Firewall rules can return HTML or an empty body instead of application JSON.
+      const body = await response.json().catch(() => null);
       if (!response.ok)
         throw new Error(
-          body.error?.message || "Could not create your playlist.",
+          response.status === 429
+            ? "You’ve reached the request limit. Please try again later. You can still copy or export your playlist."
+            : body?.error?.message ||
+                "Could not create your playlist. Please try again later.",
         );
       setPlaylist(parsePlaylist(body, count));
       setCopied(false);
@@ -235,25 +225,11 @@ export default function Home() {
       setError(
         e instanceof Error && e.name !== "TimeoutError"
           ? e.message
-          : "The request was interrupted. It may have used one generation. Check usage before trying again.",
+          : "The request was interrupted. It may have reached the music service. Please try again later.",
       );
     } finally {
       active.current = false;
       setBusy(false);
-      // Read authoritative usage after errors too; never retry generation automatically.
-      const version = ++usageVersion.current;
-      try {
-        const r = await fetch("/api/usage", { cache: "no-store" });
-        const b = await r.json();
-        if (version === usageVersion.current) {
-          if (r.ok) {
-            setUsage(b.usage);
-            setUsageReady(true);
-          } else setUsageReady(false);
-        }
-      } catch {
-        if (version === usageVersion.current) setUsageReady(false);
-      }
     }
   }
   async function copy() {
@@ -379,16 +355,14 @@ export default function Home() {
             </fieldset>
             <div className="generate-group">
               <span className="usage">
-                {usage
-                  ? `${usage.remaining} of 5 generations remaining`
-                  : usageReady
-                    ? ""
-                    : "Usage not available"}
+                {rateLimitMode === "local"
+                  ? "Local development"
+                  : "Request limits apply"}
               </span>
               <button
                 type="submit"
                 className="primary"
-                disabled={busy || limitReached || !usageReady}
+                disabled={busy || !ready}
               >
                 {busy ? (
                   <LoaderCircle size={17} className="spin" />
@@ -400,27 +374,19 @@ export default function Home() {
             </div>
           </div>
           <div className="quota-note">
-            Five generations per rolling 24 hours. Accepted attempts count, even
-            if generation fails.
+            {rateLimitMode === "local"
+              ? "Rate limits are enforced on Vercel deployments."
+              : "Request limits help keep the music flowing. Accepted attempts may count even if generation fails."}
           </div>
         </form>
-        {limitReached && (
-          <div className="message">
-            <AlertCircle size={16} />
-            <span>
-              Your next generation becomes available {resetLabel}. Your playlist
-              is still yours to explore and export.
-            </span>
-          </div>
-        )}
         {error && (
           <div className="message error" role="alert">
             <AlertCircle size={16} />
             <span>{error}</span>
-            {!usageReady && (
+            {!ready && (
               <button
                 className="text-button"
-                onClick={() => void refreshUsage()}
+                onClick={() => void refreshStatus()}
               >
                 Check connection
               </button>
@@ -492,7 +458,7 @@ export default function Home() {
               </div>
               <button
                 aria-label="Regenerate"
-                disabled={limitReached || !usageReady || busy}
+                disabled={!ready || busy}
                 onClick={() => void submit()}
               >
                 <RefreshCw size={16} />
@@ -561,8 +527,8 @@ export default function Home() {
         </span>
         <span>No account. Just music.</span>
         <p>
-          Anonymous usage limits are shared by network. Changing networks may
-          change your quota.
+          No account or database. Rate limits on Vercel may be shared by people
+          on the same network.
         </p>
       </footer>
       <div
