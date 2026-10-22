@@ -1,6 +1,6 @@
 # MoodMix
 
-Every feeling deserves a soundtrack. Single-page music discovery with Next.js, TypeScript, Tailwind CSS, Gemini, and native Vercel Firewall request limiting. No database, Redis, Upstash, login, or Spotify credentials. Roboto and JetBrains Mono are self-hosted.
+Every feeling deserves a soundtrack. Single-page music discovery with Next.js, TypeScript, Tailwind CSS, Gemini, and native Vercel Firewall request limiting. No database, Redis, Upstash, or app login. Optional Spotify previews use server-side Spotify app credentials. Roboto and JetBrains Mono are self-hosted.
 
 ## Deploy on Vercel
 
@@ -33,7 +33,7 @@ npm run build
 npm start
 ```
 
-Tests use controlled Gemini and native Firewall responses, without credentials or paid requests. Coverage includes input validation, exact unique song counts, artwork matching, exports, retry limits, native rate rejection, missing rules, timeouts, and ensuring rejected requests never call Gemini.
+Tests use controlled Gemini and native Firewall responses, without credentials or paid requests. Coverage includes input validation, exact unique song counts, artwork/Spotify matching, exports, retry limits, native rate rejection, missing rules, timeouts, Spotify token reuse and concurrent lookups, safe preview failures, and ensuring rejected generation requests never call Gemini.
 
 Optional browser checks with the production server running without Gemini credentials, Python Playwright, and Chromium:
 
@@ -41,22 +41,23 @@ Optional browser checks with the production server running without Gemini creden
 CHROMIUM_PATH=/usr/bin/chromium python tests/browser_smoke.py
 ```
 
-Browser tests use controlled status/generation/artwork responses, exercise desktop and mobile layouts, copy, TXT/CSV, regeneration, and HTML/JSON rate-limit errors, and preserve the existing playlist after a blocked request. They do not verify a real Vercel rule.
+Browser tests use controlled status/generation/artwork/Spotify responses, exercise desktop and mobile layouts, copy, TXT/CSV, regeneration, and HTML/JSON rate-limit errors, and preserve the existing playlist after a blocked request. They also check on-demand previews, one open player, session match caching, player removal on regeneration, and unavailable-track fallbacks. They do not verify a real Vercel rule or real Spotify playback.
 
 ## Behavior
 
 - `POST /api/generate`: JSON `{ "mood": "A nostalgic rainy afternoon", "count": 15 }`. Mood must be nonblank and at most 500 characters. Count must be 10, 15, or 20. Returns validated title, description, and exactly that many unique title/artist pairs.
 - `GET /api/status`: Checks Gemini configuration without calling Gemini or consuming a rate-limit check. Returns only `rateLimitMode: "vercel" | "local"`. This is a configuration check, not proof the Firewall rule is active; enforcement happens on POST.
 - `GET /api/artwork?title=...&artist=...`: Best-effort iTunes lookup; exact normalized artist/title matches only. Artwork failures never block a playlist. The browser limits concurrency to three and caches lookups in memory for the session.
+- `GET /api/spotify?title=...&artist=...`: Resolves an exact Spotify catalogue match on demand; returns only `{ track: { id, title, artists } }` or `{ track: null }`. Missing credentials and provider failures return a safe error; generation is unaffected.
 - Application errors: `{ "error": { "code": "...", "message": "...", "consumed": false } }`. `consumed` indicates the request reached generation, not a precise quota balance. Native rate rejection returns 429. An edge Firewall rule can respond with non-JSON content, which the UI also handles.
 
 Accepted requests may count toward the configured limit even if Gemini fails. No client generation retries occur automatically. Only malformed/incomplete model output gets one internal retry, without a second Firewall check. Authentication failures, provider quota errors, protection failures, and timeouts are not retried automatically.
 
-Copy/export and artwork do not call the programmatic generation limiter. Spotify buttons open searches; AI suggestions are not independently verified on Spotify. Conservative artwork matching prefers a placeholder over unrelated images. Playlists live only in the current page session. Anonymous request limits may be shared by people on the same network.
+Copy/export, artwork, and Spotify preview lookup do not call the programmatic generation limiter. Search links remain available for all AI suggestions; preview embeds are created only after a conservative Spotify title/artist match. Conservative artwork matching prefers a placeholder over unrelated images. Playlists live only in the current page session. Anonymous request limits may be shared by people on the same network.
 
 ## Verification limits
 
-Build, type checking, native-SDK API tests with controlled responses, and browser checks run locally. Real Gemini output and an active native Firewall rule require your Vercel account/configuration and are not claimed as verified. Live artwork requests may be blocked by this cloud workspace's network policy. No secrets are bundled.
+Build, type checking, native-SDK API tests with controlled responses, and browser checks run locally. Real Gemini output and an active native Firewall rule require your Vercel account/configuration and are not claimed as verified. Live Spotify playback requires your Spotify application credentials/API access and an actual browser session; it has not been verified here. Live external requests may be blocked by this cloud workspace's network policy. No secrets are bundled.
 
 ## Troubleshoot generation errors
 
@@ -70,3 +71,19 @@ The browser console's `502 Bad Gateway` alone does not identify the cause. Open 
 - `INVALID_PLAYLIST`: Gemini returned invalid/incomplete output even after the one permitted retry.
 
 `RATE_LIMITED` (429) is the configured Vercel request limit. A non-JSON gateway response may instead be a platform failure; inspect that request in Vercel's runtime logs. Never share API keys or raw environment dumps. Provider response bodies are not exposed to clients.
+
+
+## Optional Spotify preview players
+
+Each track has a Preview control that opens Spotify's official embedded player after an exact normalized title/artist lookup. No AI-generated Spotify IDs are trusted. A cover by another artist or a different version with a different title will not be substituted. Matching is intentionally conservative, so some valid collaborations/versions may not resolve. One player is mounted at a time; switching, closing, or regenerating removes the old iframe. Matches are cached in browser memory for the current session, while server access tokens are cached until shortly before expiry. Opening a preview makes no Gemini call and consumes no generation request.
+
+To enable automatic matching:
+
+1. Open the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) and create an app with **Web API** access under Spotify's current account/development-mode requirements.
+2. Copy the app's **Client ID** and **Client Secret** into Vercel → Settings → Environment Variables as `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`. Select Production and Preview if you use both, and redeploy. Never put the secret in the browser, chat, GitHub, or a `NEXT_PUBLIC_*` variable.
+3. Optionally set `SPOTIFY_MARKET` to an uppercase two-letter country code. Catalogue matching defaults to `US`; the embedded player still enforces Spotify's rules for each listener's actual region/account.
+4. Test a generated song with Preview. If Spotify denies your app API access or a track is unavailable, users retain the Spotify search action. Generation does not require these optional variables.
+
+This uses Spotify's **Client Credentials** flow for catalogue search; there is no MoodMix login, user OAuth flow, database, or Web Playback SDK. The client secret and access token remain on the server. Required outbound server hosts are `accounts.spotify.com` and `api.spotify.com`; player frames load from `open.spotify.com` in the user's browser. Spotify app eligibility, API access and development restrictions depend on your Spotify account and current policies.
+
+**Playback limits:** An embed is not a guaranteed anonymous 30-second audio file. Spotify controls whether a track offers a preview, prompts for sign-in, permits full playback, or is unavailable in a region. The app does not download audio, scrape preview URLs, promise Premium playback, or bypass Spotify restrictions. No playback starts automatically. Opening the player connects the listener's browser to Spotify; a direct Spotify link is always available if the embedded player cannot play.

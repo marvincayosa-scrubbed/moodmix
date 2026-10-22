@@ -14,6 +14,7 @@ import {
   Headphones,
   Disc3,
   X,
+  Play,
 } from "lucide-react";
 import {
   parsePlaylist,
@@ -21,6 +22,7 @@ import {
   playlistText,
   type Playlist,
 } from "@/lib/contracts";
+import { SpotifyPreview } from "@/components/spotify-preview";
 const examples = [
   "Late-night drive",
   "Slow Sunday morning",
@@ -88,6 +90,7 @@ export default function Home() {
   const [artwork, setArtwork] = useState<Record<string, string | null>>({});
   const [exportsOpen, setExportsOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [previewSong, setPreviewSong] = useState<number | null>(null);
   const active = useRef(false);
   const results = useRef<HTMLElement>(null);
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -192,6 +195,7 @@ export default function Home() {
     setError("");
     setNotice("");
     setExportsOpen(false);
+    setPreviewSong(null);
     try {
       const response = await fetch("/api/generate", {
         method: "POST",
@@ -473,33 +477,63 @@ export default function Home() {
           </div>
           <ol className="song-list">
             {playlist.songs.map((song, i) => (
-              <li key={JSON.stringify(song)} className="song-row">
-                <span className="number">{String(i + 1).padStart(2, "0")}</span>
-                <Artwork src={artwork[JSON.stringify(song)]} />
-                <div className="song-info">
-                  <span className="song-title" title={song.title}>
-                    {song.title}
+              <li key={JSON.stringify(song)} className="song-entry">
+                <div className="song-row">
+                  <span className="number">
+                    {String(i + 1).padStart(2, "0")}
                   </span>
-                  <span className="artist" title={song.artist}>
-                    {song.artist}
-                  </span>
+                  <Artwork src={artwork[JSON.stringify(song)]} />
+                  <div className="song-info">
+                    <span className="song-title" title={song.title}>
+                      {song.title}
+                    </span>
+                    <span className="artist" title={song.artist}>
+                      {song.artist}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="preview-trigger"
+                    id={`preview-trigger-${i}`}
+                    aria-label={`Preview ${song.title} by ${song.artist}`}
+                    aria-expanded={previewSong === i}
+                    aria-controls={
+                      previewSong === i ? `spotify-preview-${i}` : undefined
+                    }
+                    onClick={() => setPreviewSong(previewSong === i ? null : i)}
+                  >
+                    <Play size={15} />
+                    <span>Preview</span>
+                  </button>
+                  <a
+                    className="spotify-link"
+                    href={`https://open.spotify.com/search/${encodeURIComponent(`${song.title} ${song.artist}`)}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-label={`Search Spotify for ${song.title} by ${song.artist}`}
+                  >
+                    <span>Spotify</span>
+                    <ArrowUpRight size={17} />
+                  </a>
                 </div>
-                <a
-                  className="spotify-link"
-                  href={`https://open.spotify.com/search/${encodeURIComponent(`${song.title} ${song.artist}`)}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  aria-label={`Search Spotify for ${song.title} by ${song.artist}`}
-                >
-                  <span>Spotify</span>
-                  <ArrowUpRight size={17} />
-                </a>
+                {previewSong === i && (
+                  <SpotifyPreview
+                    key={JSON.stringify(song)}
+                    song={song}
+                    id={`spotify-preview-${i}`}
+                    onClose={() => {
+                      setPreviewSong(null);
+                      document.getElementById(`preview-trigger-${i}`)?.focus();
+                    }}
+                  />
+                )}
               </li>
             ))}
           </ol>
           <p className="result-note">
-            AI recommendations, made to explore. Songs aren’t independently
-            verified on Spotify. Artwork via iTunes, when available.
+            AI recommendations, made to explore. Preview players appear for
+            matched Spotify tracks; playback availability is controlled by
+            Spotify. Artwork via iTunes, when available.
           </p>
         </section>
       ) : (

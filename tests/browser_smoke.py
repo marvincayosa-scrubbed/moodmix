@@ -3,6 +3,7 @@ Uses mocked API responses; does not spend real Gemini quota.
 Start `npm run build && npm start` first. Screenshots are written under /tmp.
 """
 import os
+from urllib.parse import urlsplit, parse_qs
 from playwright.sync_api import sync_playwright
 
 with sync_playwright() as p:
@@ -34,6 +35,20 @@ with sync_playwright() as p:
             route.fulfill(json=payload)
     page.route('**/api/generate',generate)
     page.route('**/api/artwork?*',lambda r:r.fulfill(json={'artwork':None}))
+    spotify_calls = []
+    def spotify(route):
+        title = parse_qs(urlsplit(route.request.url).query)['title'][0]
+        spotify_calls.append(title)
+        if title.endswith('3'):
+            route.fulfill(json={'track':None})
+        elif title.endswith('4'):
+            route.fulfill(status=503,json={'error':{'code':'SPOTIFY_NOT_CONFIGURED','message':'Spotify preview is unavailable right now. You can still open the song on Spotify.'}})
+        else:
+            track_id = 'ABCDEFGHIJKLMNOPQRSTUV' if title.endswith('2') else '0123456789ABCDEFGHIJKL'
+            route.fulfill(json={'track':{'id':track_id,'title':title,'artists':['Artist']}})
+    page.route('**/api/spotify?*',spotify)
+    page.route('https://open.spotify.com/embed/**',lambda r:r.fulfill(content_type='text/html',body='<html><body style="background:#191b1e;color:#a0a4ab;font:14px sans-serif">Spotify player — controlled browser test</body></html>'))
+
     page.reload()
     page.get_by_role('button',name='Generate playlist').wait_for(state='visible')
     page.wait_for_function("!document.querySelector('button[type=submit]').disabled")
@@ -54,6 +69,31 @@ with sync_playwright() as p:
     assert state['calls']==1
     assert page.locator('textarea').input_value()=='Late-night drive'
     assert 'A%20song' in page.locator('.spotify-link').first.get_attribute('href')
+    assert page.locator('iframe').count() == 0
+    assert not spotify_calls, 'No Spotify lookups before a preview click'
+    page.locator('.preview-trigger').nth(0).click()
+    page.locator('iframe').wait_for()
+    assert '0123456789ABCDEFGHIJKL' in page.locator('iframe').get_attribute('src')
+    assert len(spotify_calls) == 1
+    page.get_by_role('button',name='Close Spotify preview').click()
+    assert page.locator('iframe').count() == 0
+    assert page.evaluate('document.activeElement.id') == 'preview-trigger-0'
+    page.locator('.preview-trigger').nth(0).click()
+    page.locator('iframe').wait_for()
+    assert len(spotify_calls) == 1, 'Successful match cached in browser memory'
+    page.locator('.preview-trigger').nth(1).click()
+    page.wait_for_function("document.querySelector('iframe')?.src.includes('ABCDEFGHIJKLMNOPQRSTUV')")
+    assert page.locator('iframe').count() == 1, 'Only one player can be open'
+    page.locator('.preview-trigger').nth(2).click()
+    page.get_by_text('No exact Spotify match found.',exact=False).wait_for()
+    assert page.locator('iframe').count() == 0
+    page.locator('.preview-trigger').nth(3).click()
+    page.get_by_text('Spotify preview is unavailable right now.',exact=False).wait_for()
+    assert page.locator('iframe').count() == 0
+    assert state['calls'] == 1, 'Preview does not generate a playlist or spend generation quota'
+    page.locator('.preview-trigger').nth(0).click()
+    page.locator('iframe').wait_for()
+
     page.get_by_role('button',name='Copy',exact=True).click()
     assert 'Playlist copied.' in page.get_by_role('status').inner_text()
     assert '1. A song for the evening 1' in page.evaluate('navigator.clipboard.readText()')
@@ -72,6 +112,7 @@ with sync_playwright() as p:
     page.get_by_role('button',name='20 songs',exact=True).click()
     page.get_by_role('button',name='Regenerate',exact=True).click()
     page.wait_for_function("document.querySelectorAll('.song-list li').length===20")
+    assert page.locator('iframe').count() == 0, 'Regeneration closes the old player'
     assert state['calls']==2
     for kind in ['json','html']:
         state['block'] = kind
@@ -91,4 +132,4 @@ with sync_playwright() as p:
     page.wait_for_function("document.querySelector('.song-list')!==null")
     assert not errors, errors
     browser.close()
-    print('PASS: missing config, validation, prompts, skeleton, exact counts, Spotify links, copy, TXT/CSV downloads, regeneration, native JSON/HTML rate-limit errors, responsive widths; no browser errors.')
+    print('PASS: missing config, validation, prompts, skeleton, exact counts, Spotify links, copy, TXT/CSV downloads, regeneration, native JSON/HTML rate-limit errors, Spotify previews/matching/cache/fallback/one-player behavior, responsive widths; no browser errors.')
