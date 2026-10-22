@@ -6,6 +6,7 @@ export class ServiceError extends Error {
     message: string,
     public status = 503,
     public code = "SERVICE_UNAVAILABLE",
+    public upstreamStatus?: number,
   ) {
     super(message);
   }
@@ -47,6 +48,53 @@ export async function enforceRateLimit(request: Request) {
       429,
       "RATE_LIMITED",
     );
+}
+async function geminiFailure(response: Response): Promise<ServiceError> {
+  // Inspect only known error indicators. Never expose Google's raw response,
+  // which may include request details or credentials.
+  let invalidKey = response.status === 401;
+  if (response.status === 400) {
+    const body = await response.json().catch(() => null);
+    const message =
+      typeof body?.error?.message === "string" ? body.error.message : "";
+    const details = Array.isArray(body?.error?.details)
+      ? body.error.details
+      : [];
+    invalidKey =
+      /api key not valid|api key expired/i.test(message) ||
+      details.some(
+        (detail: unknown) =>
+          detail !== null &&
+          typeof detail === "object" &&
+          ["API_KEY_INVALID", "API_KEY_EXPIRED"].includes(
+            String((detail as Record<string, unknown>).reason),
+          ),
+      );
+  }
+  let code = "GEMINI_UNAVAILABLE";
+  let message = "Gemini is temporarily unavailable. Please try again later.";
+  if (invalidKey) {
+    code = "GEMINI_INVALID_KEY";
+    message =
+      "Gemini rejected the API key. The site owner should check GEMINI_API_KEY in Vercel and redeploy.";
+  } else if (response.status === 403) {
+    code = "GEMINI_ACCESS_DENIED";
+    message =
+      "Gemini denied access. Check the API key restrictions, Google project permissions, and regional availability.";
+  } else if (response.status === 404) {
+    code = "GEMINI_MODEL_NOT_FOUND";
+    message =
+      "The configured Gemini model was not found. Set GEMINI_MODEL in Vercel to a model available to your Google AI Studio project, then redeploy.";
+  } else if (response.status === 429) {
+    code = "GEMINI_QUOTA_EXCEEDED";
+    message =
+      "Gemini has reached its API quota or rate limit. Check your Google AI Studio usage and available quota before trying again.";
+  } else if (response.status === 400) {
+    code = "GEMINI_REQUEST_REJECTED";
+    message =
+      "Gemini rejected the request. Check that GEMINI_MODEL supports structured JSON output and is available to your Google project.";
+  }
+  return new ServiceError(message, 502, code, response.status);
 }
 export async function generate(mood: string, count: number) {
   const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
@@ -118,14 +166,7 @@ export async function generate(mood: string, count: number) {
         "UPSTREAM_TIMEOUT",
       );
     }
-    if (!response.ok)
-      throw new ServiceError(
-        response.status === 429
-          ? "The music service has reached its quota. Try later; this attempt was sent to the music service."
-          : "The music service could not complete this request. This attempt was sent to the music service.",
-        502,
-        "UPSTREAM_ERROR",
-      );
+    if (!response.ok) throw await geminiFailure(response);
     try {
       const body = await response.json();
       const candidate = body.candidates?.[0];
@@ -154,7 +195,16 @@ export function errorResponse(error: unknown, consumed = false) {
       ? error
       : new ServiceError("Something went wrong. Please try later.");
   return Response.json(
-    { error: { code: e.code, message: e.message, consumed } },
+    {
+      error: {
+        code: e.code,
+        message: e.message,
+        consumed,
+        ...(e.upstreamStatus !== undefined
+          ? { upstreamStatus: e.upstreamStatus }
+          : {}),
+      },
+    },
     { status: e.status, headers: { "Cache-Control": "no-store" } },
   );
 }

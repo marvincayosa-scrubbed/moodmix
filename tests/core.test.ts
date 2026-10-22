@@ -179,16 +179,56 @@ test("backend integration and native Vercel rate limiting", async (t) => {
     assert.deepEqual(await generate("quiet", 10), playlist);
     assert.equal(calls, 2);
   });
-  for (const status of [401, 403, 429, 500])
+  for (const [status, code] of [
+    [400, "GEMINI_REQUEST_REJECTED"],
+    [401, "GEMINI_INVALID_KEY"],
+    [403, "GEMINI_ACCESS_DENIED"],
+    [404, "GEMINI_MODEL_NOT_FOUND"],
+    [429, "GEMINI_QUOTA_EXCEEDED"],
+    [500, "GEMINI_UNAVAILABLE"],
+    [503, "GEMINI_UNAVAILABLE"],
+  ] as const)
     await t.test(`Gemini ${status} never retries`, async () => {
       let calls = 0;
       global.fetch = async () => {
         calls++;
         return new Response(null, { status });
       };
-      await assert.rejects(() => generate("quiet", 10));
+      await assert.rejects(
+        () => generate("quiet", 10),
+        (e: unknown) =>
+          e instanceof ServiceError &&
+          e.code === code &&
+          e.upstreamStatus === status,
+      );
       assert.equal(calls, 1);
     });
+  await t.test(
+    "Google's invalid-key 400 is recognized without leaking its response",
+    async () => {
+      let calls = 0;
+      global.fetch = async () => {
+        calls++;
+        return Response.json(
+          {
+            error: {
+              message: "PRIVATE PROVIDER DETAILS",
+              details: [{ reason: "API_KEY_INVALID" }],
+            },
+          },
+          { status: 400 },
+        );
+      };
+      await assert.rejects(
+        () => generate("quiet", 10),
+        (e: unknown) =>
+          e instanceof ServiceError &&
+          e.code === "GEMINI_INVALID_KEY" &&
+          !e.message.includes("PRIVATE PROVIDER DETAILS"),
+      );
+      assert.equal(calls, 1);
+    },
+  );
   await t.test("model timeout never retries", async () => {
     let calls = 0;
     global.fetch = async () => {
@@ -311,7 +351,10 @@ test("backend integration and native Vercel rate limiting", async (t) => {
           : new Response(null, { status: 429 });
       const r = await POST(req());
       assert.equal(r.status, 502);
-      assert.equal((await r.json()).error.consumed, true);
+      const body = await r.json();
+      assert.equal(body.error.consumed, true);
+      assert.equal(body.error.code, "GEMINI_QUOTA_EXCEEDED");
+      assert.equal(body.error.upstreamStatus, 429);
       assert.equal(calls, 2);
     },
   );

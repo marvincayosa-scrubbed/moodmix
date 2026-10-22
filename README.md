@@ -57,3 +57,16 @@ Copy/export and artwork do not call the programmatic generation limiter. Spotify
 ## Verification limits
 
 Build, type checking, native-SDK API tests with controlled responses, and browser checks run locally. Real Gemini output and an active native Firewall rule require your Vercel account/configuration and are not claimed as verified. Live artwork requests may be blocked by this cloud workspace's network policy. No secrets are bundled.
+
+## Troubleshoot generation errors
+
+The browser console's `502 Bad Gateway` alone does not identify the cause. Open DevTools → Network → the failed `/api/generate` request → Response. Application errors include a safe code and, for rejected Gemini requests, `upstreamStatus`:
+
+- `GEMINI_INVALID_KEY`: check the server-side Gemini key and redeploy after correcting it.
+- `GEMINI_ACCESS_DENIED`: check key restrictions, Google project permissions and regional availability.
+- `GEMINI_MODEL_NOT_FOUND`: set `GEMINI_MODEL` to a compatible model available to your Google AI Studio project, then redeploy.
+- `GEMINI_QUOTA_EXCEEDED`: check Google AI Studio quota and usage. Repeated retries do not restore quota.
+- `GEMINI_REQUEST_REJECTED`: check model compatibility with structured JSON output.
+- `INVALID_PLAYLIST`: Gemini returned invalid/incomplete output even after the one permitted retry.
+
+`RATE_LIMITED` (429) is the configured Vercel request limit. A non-JSON gateway response may instead be a platform failure; inspect that request in Vercel's runtime logs. Never share API keys or raw environment dumps. Provider response bodies are not exposed to clients.
